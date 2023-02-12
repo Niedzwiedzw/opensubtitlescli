@@ -965,7 +965,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "opensubtitleshash"
+name = "opensubtitlescli"
 version = "0.1.0"
 dependencies = [
  "clap",
