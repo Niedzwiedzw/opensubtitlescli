@@ -35,7 +35,7 @@ fn create_hash(file: File, fsize: u64) -> Result<String> {
     let mut reader = BufReader::with_capacity(HASH_BLK_SIZE as usize, file);
 
     for _ in 0..iterations {
-        reader.read(&mut buf)?;
+        reader.read_exact(&mut buf)?;
         unsafe {
             word = mem::transmute(buf);
         };
@@ -45,7 +45,7 @@ fn create_hash(file: File, fsize: u64) -> Result<String> {
     reader.seek(SeekFrom::Start(fsize - HASH_BLK_SIZE))?;
 
     for _ in 0..iterations {
-        reader.read(&mut buf)?;
+        reader.read_exact(&mut buf)?;
         unsafe {
             word = mem::transmute(buf);
         };
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
         .prompt()
         .wrap_err("you must choose a valid subtitle file")?;
     let extension = file
-        .split(".")
+        .split('.')
         .last()
         .ok_or_else(|| eyre!("this file has no extension"))?;
 
@@ -171,8 +171,5 @@ async fn main() -> Result<()> {
         .await
         .wrap_err_with(|| format!("writing subtitle file to {target_file_name:?}"))?;
     println!("{target_file_name:?}");
-    // let files =
-    // println!("{download_url}");
-
     Ok(())
 }
