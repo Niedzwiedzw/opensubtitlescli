@@ -1,15 +1,17 @@
+use clap::Parser;
 #[allow(unused_imports)]
 use eyre::{bail, eyre, Result, WrapErr};
+use itertools::Itertools;
 use reqwest::Url;
-use std::fs;
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::mem;
+use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, File},
+    io::{BufReader, Read, Seek, SeekFrom},
+    mem,
+};
+use tokio::process::Command;
 #[allow(unused_imports)]
 use tracing::{debug, error, info, instrument, trace, warn};
-
-use clap::Parser;
-use std::path::{Path, PathBuf};
 
 const HASH_BLK_SIZE: u64 = 65536;
 
@@ -22,6 +24,9 @@ struct Cli {
     pub movie_file: PathBuf,
     #[arg(short, long, default_value = "eng")]
     pub language: String,
+    /// you will be presented with top n values to choose from
+    #[arg(short, long, default_value_t = 1)]
+    pub top_n: usize,
 }
 
 fn create_hash(file: File, fsize: u64) -> Result<String> {
@@ -65,7 +70,8 @@ fn hash_for_file<P: AsRef<Path> + std::fmt::Debug>(path: P) -> Result<String> {
     create_hash(std::fs::File::open(path).wrap_err("opening file")?, size)
 }
 static BASE_URL: &str = "https://www.opensubtitles.org";
-fn url(lang: String, hash: String) -> Result<Url> {
+
+fn url(lang: &str, hash: String) -> Result<Url> {
     format!("{BASE_URL}/pl/search/sublanguageid-{lang}/moviehash-{hash}")
         .parse()
         .wrap_err("invalid url")
@@ -81,7 +87,66 @@ fn to_url_in_base(url: &str) -> Result<Url> {
 
 pub mod crawler {
     use super::*;
-    use scraper::{Html, Selector};
+    use ordered_float::OrderedFloat;
+    use scraper::{ElementRef, Html, Selector};
+    use tap::TapFallible;
+
+    impl std::fmt::Display for SubsEntry {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "[{} (rating: {})]", self.download_url, self.rating)
+        }
+    }
+    #[derive(Debug, Clone)]
+    pub struct SubsEntry {
+        pub name: String,
+        pub flag: String,
+        pub cd: String,
+        pub sent: String,
+        pub download_url: Url,
+        pub rating: f32,
+        pub edits: i32,
+        pub imdb_rating: f32,
+        pub uploaded_by: String,
+    }
+
+    impl SubsEntry {
+        fn from_table_row_element(element: ElementRef<'_>) -> Result<Self> {
+            let tr_selector = Selector::parse("td").map_err(|e| eyre!("{e:?}"))?;
+            let a_selector = Selector::parse("a").map_err(|e| eyre!("{e:?}"))?;
+            let mut trs = element.select(&tr_selector);
+            let mut idx: i32 = -1;
+            let mut next = || {
+                idx += 1;
+                trs.next()
+                    .ok_or_else(|| eyre!("fetching entry number [{idx}]"))
+            };
+            Ok(Self {
+                name: next().map(|v| v.text().join(" "))?,
+                flag: next().map(|v| v.text().join(" "))?,
+                cd: next().map(|v| v.text().join(" "))?,
+                sent: next().map(|v| v.text().join(" "))?,
+                download_url: next().and_then(|tr| {
+                    tr.select(&a_selector)
+                        .next()
+                        .ok_or_else(|| eyre!("no a element"))
+                        .and_then(|v| {
+                            v.value()
+                                .attr("href")
+                                .ok_or_else(|| eyre!("no href element"))
+                                .and_then(to_url_in_base)
+                        })
+                        .wrap_err_with(|| format!("extracting download url from [{}]", tr.html()))
+                })?,
+                rating: next()
+                    .and_then(|v| v.text().join(" ").trim().parse().wrap_err("not a float"))?,
+                edits: next()
+                    .and_then(|v| v.text().join(" ").trim().parse().wrap_err("not an int"))?,
+                imdb_rating: next()
+                    .and_then(|v| v.text().join(" ").trim().parse().wrap_err("not a float"))?,
+                uploaded_by: next().map(|v| v.text().join(" "))?,
+            })
+        }
+    }
 
     #[instrument(fields(url=%url))]
     pub async fn get_page(url: Url) -> Result<String> {
@@ -93,30 +158,44 @@ pub mod crawler {
             .await
             .wrap_err("parsing page string")
     }
-    pub fn top_rated_sub(page: String) -> Result<Url> {
+    pub fn top_rated_subs(page: String, top_n: usize) -> Result<Vec<SubsEntry>> {
         let html = Html::parse_document(&page);
-        let selector = Selector::parse("a.bnone").map_err(|e| eyre!("{e:?}"))?;
-        let link = html
-            .select(&selector)
+        let tr_selector = Selector::parse("tr").map_err(|e| eyre!("{e:?}"))?;
+        let search_results_selector =
+            Selector::parse("table#search_results").map_err(|e| eyre!("{e:?}"))?;
+        html.select(&search_results_selector)
             .next()
-            .ok_or_else(|| eyre!("no elements found"))?;
-        link.value()
-            .attr("href")
-            .ok_or_else(|| eyre!("no link present"))
-            .and_then(to_url_in_base)
+            .ok_or_else(|| eyre!("no search result table"))
+            .map(|html| {
+                html.select(&tr_selector)
+                    .skip(1)
+                    .filter_map(|tr| {
+                        SubsEntry::from_table_row_element(tr)
+                            .wrap_err_with(|| format!("parsing tr:\n{}", tr.html()))
+                            .tap_err(|message| {
+                                warn!(?message, "parsing failed");
+                            })
+                            .ok()
+                    })
+                    .sorted_unstable_by_key(|v| OrderedFloat(-v.rating))
+                    .take(top_n)
+                    .collect::<Vec<_>>()
+            })
     }
 
     pub fn sub_download_url(page: String) -> Result<Url> {
         let html = Html::parse_document(&page);
-        let selector = Selector::parse("#bt-dwl-bt").map_err(|e| eyre!("{e:?}"))?;
-        let link = html
-            .select(&selector)
+        let selector = Selector::parse("tr").map_err(|e| eyre!("{e:?}"))?;
+
+        html.select(&selector)
             .next()
-            .ok_or_else(|| eyre!("no elements found"))?;
-        link.value()
-            .attr("href")
-            .ok_or_else(|| eyre!("no link present"))
-            .and_then(to_url_in_base)
+            .ok_or_else(|| eyre!("no element on page"))
+            .and_then(|v| {
+                v.value()
+                    .attr("href")
+                    .ok_or_else(|| eyre!("no link present"))
+                    .and_then(to_url_in_base)
+            })
     }
 
     pub async fn get_zip(url: Url) -> Result<Vec<u8>> {
@@ -130,31 +209,47 @@ pub mod crawler {
     }
 }
 
+fn prompt_unless_single<T: Clone + std::fmt::Display>(prompt: &str, values: Vec<T>) -> Result<T> {
+    match &values[..] {
+        [single] => Ok(single.clone()),
+        values => inquire::Select::new(prompt, values.to_vec())
+            .prompt()
+            .wrap_err("invalid selection"),
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let Cli {
         movie_file,
         language,
+        top_n,
     } = Cli::parse();
     info!(?movie_file, %language, "downloading");
     let hash = hash_for_file(&movie_file)?;
-    let url = url(language, hash)?;
+    let url = url(&language, hash)?;
     let page = crawler::get_page(url).await?;
-    let link = crawler::top_rated_sub(page)?;
-    let download_page = crawler::get_page(link).await?;
-    let download_url = crawler::sub_download_url(download_page)?;
+    let link = crawler::top_rated_subs(page, top_n).and_then(|values| {
+        prompt_unless_single("which url do your want to download", values)
+            .wrap_err("selecting url to download")
+    })?;
+    let download_url = link.download_url;
     let zip = crawler::get_zip(download_url).await?;
     let mut zip_contents = std::io::Cursor::new(zip);
     let mut zip_reader = ::zip::ZipArchive::new(&mut zip_contents).wrap_err("reading zip")?;
     let files = zip_reader
         .file_names()
+        .filter(|e| !e.to_lowercase().trim().ends_with(".nfo"))
         .map(|v| v.to_string())
+        .sorted_unstable_by_key(|v| v.to_lowercase().ends_with(".srt"))
+        .rev()
         .collect::<Vec<_>>();
     info!(?files, "found files");
-    let file = inquire::Select::new("Select the subtitle file", files)
-        .prompt()
-        .wrap_err("you must choose a valid subtitle file")?;
+
+    let file = prompt_unless_single("Select the subtitle file", files)
+        .wrap_err("choosing subtitle file")?;
+
     let extension = file
         .split('.')
         .last()
@@ -166,10 +261,56 @@ async fn main() -> Result<()> {
         .bytes()
         .map(|v| v.wrap_err("invalid byte"))
         .collect::<Result<Vec<_>>>()?;
-    let target_file_name = movie_file.with_extension(extension);
-    tokio::fs::write(&target_file_name, &file)
+    let subtitle_file = movie_file.with_extension(extension);
+    tokio::fs::write(&subtitle_file, &file)
         .await
-        .wrap_err_with(|| format!("writing subtitle file to {target_file_name:?}"))?;
-    println!("{target_file_name:?}");
-    Ok(())
+        .wrap_err_with(|| format!("writing subtitle file to {subtitle_file:?}"))?;
+    println!("{subtitle_file:?}");
+    let with_subtitles_name = movie_file
+        .extension()
+        .and_then(|e| e.to_str())
+        .ok_or_else(|| eyre!("file has no extension"))
+        .map(|extension| format!("with-subs.{extension}"))
+        .map(|extension| movie_file.with_extension(extension))
+        .wrap_err_with(|| format!("generating a with-subs file name for [{movie_file:?}]"))?;
+
+    match inquire::Select::new(
+        &format!("soft-embed subtitles into [{with_subtitles_name:?}]?"),
+        vec![true, false],
+    )
+    .prompt()
+    .unwrap_or_default()
+    {
+        true => {
+            info!(?with_subtitles_name, "saving video with subs to new path");
+            Command::new("ffmpeg")
+                .arg("-i")
+                .arg(movie_file.as_os_str())
+                .arg("-i")
+                .arg(subtitle_file.as_os_str())
+                .args([
+                    "-map",
+                    "0",
+                    "-map",
+                    "1",
+                    "-c",
+                    "copy",
+                    "-c:s",
+                    "mov_text",
+                    "-metadata:s:s:1",
+                ])
+                .arg(format!("language={language}"))
+                .arg(with_subtitles_name)
+                .status()
+                .await
+                .wrap_err("embedding the subtitles")
+                .and_then(|status| {
+                    status
+                        .success()
+                        .then_some(())
+                        .ok_or_else(|| eyre!("bad status code: [{status:?}]"))
+                })
+        }
+        false => Ok(()),
+    }
 }
