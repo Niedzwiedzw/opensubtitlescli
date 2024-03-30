@@ -9,6 +9,7 @@ use std::{
     io::{BufReader, Read, Seek, SeekFrom},
     mem,
 };
+use tap::prelude::*;
 use tokio::process::Command;
 #[allow(unused_imports)]
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -89,7 +90,6 @@ pub mod crawler {
     use super::*;
     use ordered_float::OrderedFloat;
     use scraper::{ElementRef, Html, Selector};
-    use tap::TapFallible;
 
     impl std::fmt::Display for SubsEntry {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -300,7 +300,7 @@ async fn main() -> Result<()> {
                     "-metadata:s:s:1",
                 ])
                 .arg(format!("language={language}"))
-                .arg(with_subtitles_name)
+                .arg(&with_subtitles_name)
                 .status()
                 .await
                 .wrap_err("embedding the subtitles")
@@ -309,6 +309,9 @@ async fn main() -> Result<()> {
                         .success()
                         .then_some(())
                         .ok_or_else(|| eyre!("bad status code: [{status:?}]"))
+                })
+                .tap_ok(move |_| {
+                    info!("file with subtitles available at {with_subtitles_name:?}");
                 })
         }
         false => Ok(()),
