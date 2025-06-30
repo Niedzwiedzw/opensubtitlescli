@@ -20,7 +20,6 @@ const HASH_BLK_SIZE: u64 = 65536;
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// file path
-    #[arg(short, long)]
     pub movie_file: PathBuf,
     #[arg(short, long, default_value = "eng")]
     pub language: String,
@@ -223,6 +222,7 @@ async fn main() -> Result<()> {
     } = Cli::parse();
     info!(?movie_file, %language, "downloading");
     let hash = hash_for_file(&movie_file)?;
+    info!("hash: {hash}");
     let url = url(&language, hash)?;
     let page = crawler::get_page(url).await?;
     let link = crawler::top_rated_subs(page, top_n).and_then(|values| {
