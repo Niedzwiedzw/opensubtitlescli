@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::{
     fs::{self, File},
     io::{BufReader, Read, Seek, SeekFrom},
-    mem,
 };
 use tap::prelude::*;
 use tokio::process::Command;
@@ -42,9 +41,7 @@ fn create_hash(file: File, fsize: u64) -> Result<String> {
 
     for _ in 0..iterations {
         reader.read_exact(&mut buf)?;
-        unsafe {
-            word = mem::transmute(buf);
-        };
+        word = u64::from_ne_bytes(buf);
         hash_val = hash_val.wrapping_add(word);
     }
 
@@ -52,9 +49,7 @@ fn create_hash(file: File, fsize: u64) -> Result<String> {
 
     for _ in 0..iterations {
         reader.read_exact(&mut buf)?;
-        unsafe {
-            word = mem::transmute(buf);
-        };
+        word = u64::from_ne_bytes(buf);
         hash_val = hash_val.wrapping_add(word);
     }
 
@@ -252,12 +247,13 @@ async fn main() -> Result<()> {
 
     let extension = file
         .split('.')
-        .last()
+        .next_back()
         .ok_or_else(|| eyre!("this file has no extension"))?;
 
     let file = zip_reader
         .by_name(&file)
         .wrap_err_with(|| format!("extracting {file} from the archive"))?
+        .pipe(BufReader::new)
         .bytes()
         .map(|v| v.wrap_err("invalid byte"))
         .collect::<Result<Vec<_>>>()?;
