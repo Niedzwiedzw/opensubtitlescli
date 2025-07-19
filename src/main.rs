@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 #[allow(unused_imports)]
 use eyre::{bail, eyre, Result, WrapErr};
 use itertools::Itertools;
@@ -26,6 +26,16 @@ struct Cli {
     /// you will be presented with top n values to choose from
     #[arg(short, long, default_value_t = 1)]
     pub top_n: usize,
+    #[command(subcommand)]
+    pub command: Option<HelperCommand>,
+}
+
+#[derive(Subcommand)]
+enum HelperCommand {
+    EmbedSubs {
+        /// source sub file
+        subs: PathBuf,
+    },
 }
 
 fn create_hash(file: File, fsize: u64) -> Result<String> {
@@ -66,6 +76,12 @@ fn hash_for_file<P: AsRef<Path> + std::fmt::Debug>(path: P) -> Result<String> {
 }
 static BASE_URL: &str = "https://www.opensubtitles.org";
 
+macro_rules! sel {
+    ($sel:expr) => {
+        Selector::parse($sel).unwrap_or_else(|e| panic!("parsing selector: {}\n{e:?}", $sel))
+    };
+}
+
 fn url(lang: &str, hash: String) -> Result<Url> {
     format!("{BASE_URL}/pl/search/sublanguageid-{lang}/moviehash-{hash}")
         .parse()
@@ -81,7 +97,10 @@ fn to_url_in_base(url: &str) -> Result<Url> {
 }
 
 pub mod crawler {
+    use std::convert::identity;
+
     use super::*;
+    use eyre::ContextCompat;
     use ordered_float::OrderedFloat;
     use scraper::{ElementRef, Html, Selector};
 
@@ -93,14 +112,13 @@ pub mod crawler {
     #[derive(Debug, Clone)]
     pub struct SubsEntry {
         pub name: String,
-        pub flag: String,
         pub cd: String,
         pub sent: String,
         pub download_url: Url,
         pub rating: f32,
-        pub edits: i32,
-        pub imdb_rating: f32,
-        pub uploaded_by: String,
+        // pub edits: i32,
+        // pub imdb_rating: f32,
+        // pub uploaded_by: String,
     }
 
     impl SubsEntry {
@@ -116,7 +134,6 @@ pub mod crawler {
             };
             Ok(Self {
                 name: next().map(|v| v.text().join(" "))?,
-                flag: next().map(|v| v.text().join(" "))?,
                 cd: next().map(|v| v.text().join(" "))?,
                 sent: next().map(|v| v.text().join(" "))?,
                 download_url: next().and_then(|tr| {
@@ -127,17 +144,19 @@ pub mod crawler {
                             v.value()
                                 .attr("href")
                                 .ok_or_else(|| eyre!("no href element"))
-                                .and_then(to_url_in_base)
+                                .and_then(|url| {
+                                    url.parse().wrap_err_with(|| format!("invalid url: {url}"))
+                                })
                         })
                         .wrap_err_with(|| format!("extracting download url from [{}]", tr.html()))
                 })?,
-                rating: next()
-                    .and_then(|v| v.text().join(" ").trim().parse().wrap_err("not a float"))?,
-                edits: next()
-                    .and_then(|v| v.text().join(" ").trim().parse().wrap_err("not an int"))?,
-                imdb_rating: next()
-                    .and_then(|v| v.text().join(" ").trim().parse().wrap_err("not a float"))?,
-                uploaded_by: next().map(|v| v.text().join(" "))?,
+                rating: next().and_then(|v| {
+                    v.text()
+                        .join(" ")
+                        .trim()
+                        .parse()
+                        .wrap_err("rating is not a float")
+                })?,
             })
         }
     }
@@ -154,26 +173,43 @@ pub mod crawler {
     }
     pub fn top_rated_subs(page: String, top_n: usize) -> Result<Vec<SubsEntry>> {
         let html = Html::parse_document(&page);
-        let tr_selector = Selector::parse("tr").map_err(|e| eyre!("{e:?}"))?;
-        let search_results_selector =
-            Selector::parse("table#search_results").map_err(|e| eyre!("{e:?}"))?;
-        html.select(&search_results_selector)
-            .next()
-            .ok_or_else(|| eyre!("no search result table"))
-            .map(|html| {
-                html.select(&tr_selector)
-                    .skip(1)
-                    .filter_map(|tr| {
-                        SubsEntry::from_table_row_element(tr)
-                            .wrap_err_with(|| format!("parsing tr:\n{}", tr.html()))
-                            .tap_err(|message| {
-                                warn!(?message, "parsing failed");
+        let tr_selector = sel!("tr");
+        html.select(&sel!("table"))
+            .filter(|table| {
+                table.html().to_lowercase().pipe_deref(|table| {
+                    [
+                        table.contains("release"),
+                        table.contains("odd"),
+                        table.contains("even"),
+                    ]
+                    .into_iter()
+                    .all(identity)
+                })
+            })
+            .collect_vec()
+            .pipe(|tables| {
+                tables
+                    .iter()
+                    .find_map(|html| {
+                        html.select(&tr_selector)
+                            .skip(1)
+                            .map(|tr| {
+                                SubsEntry::from_table_row_element(tr)
+                                    .wrap_err_with(|| format!("parsing tr:\n{}", tr.html()))
+                                    .tap_err(|message| {
+                                        warn!(?message, "parsing failed");
+                                    })
                             })
+                            .collect::<Result<Vec<_>>>()
+                            .context("parsing entries")
+                            .tap_ok_mut(|entries| {
+                                entries.sort_by_key(|v| OrderedFloat(-v.rating));
+                            })
+                            .map(|entries| entries.into_iter().take(top_n).collect_vec())
+                            .tap_err(|e| debug!("parsing entry {e:?}:\n{}", html.html()))
                             .ok()
                     })
-                    .sorted_unstable_by_key(|v| OrderedFloat(-v.rating))
-                    .take(top_n)
-                    .collect::<Vec<_>>()
+                    .wrap_err_with(|| format!("could not find table among {} tables", tables.len()))
             })
     }
 
@@ -212,6 +248,51 @@ fn prompt_unless_single<T: Clone + std::fmt::Display>(prompt: &str, values: Vec<
     }
 }
 
+fn with_subtitles_filename(movie_file: &Path) -> Result<PathBuf> {
+    movie_file
+        .extension()
+        .and_then(|e| e.to_str())
+        .ok_or_else(|| eyre!("file has no extension"))
+        .map(|extension| format!("with-subs.{extension}"))
+        .map(|extension| movie_file.with_extension(extension))
+        .wrap_err_with(|| format!("generating a with-subs file name for [{movie_file:?}]"))
+}
+
+async fn soft_embed_subs(movie_file: &Path, subtitle_file: &Path, language: &str) -> Result<()> {
+    let with_subtitles_name = with_subtitles_filename(movie_file)?;
+    info!(?with_subtitles_name, "saving video with subs to new path");
+    Command::new("ffmpeg")
+        .arg("-i")
+        .arg(movie_file.as_os_str())
+        .arg("-i")
+        .arg(subtitle_file.as_os_str())
+        .args([
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+            "-c:s",
+            "mov_text",
+            "-metadata:s:s:1",
+        ])
+        .arg(format!("language={language}"))
+        .arg(&with_subtitles_filename(movie_file)?)
+        .status()
+        .await
+        .wrap_err("embedding the subtitles")
+        .and_then(|status| {
+            status
+                .success()
+                .then_some(())
+                .ok_or_else(|| eyre!("bad status code: [{status:?}]"))
+        })
+        .tap_ok(move |_| {
+            info!("file with subtitles available at {with_subtitles_name:?}");
+        })
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -219,97 +300,72 @@ async fn main() -> Result<()> {
         movie_file,
         language,
         top_n,
+        command,
     } = Cli::parse();
-    info!(?movie_file, %language, "downloading");
-    let hash = hash_for_file(&movie_file)?;
-    info!("hash: {hash}");
-    let url = url(&language, hash)?;
-    let page = crawler::get_page(url).await?;
-    let link = crawler::top_rated_subs(page, top_n).and_then(|values| {
-        prompt_unless_single("which url do your want to download", values)
-            .wrap_err("selecting url to download")
-    })?;
-    let download_url = link.download_url;
-    let zip = crawler::get_zip(download_url).await?;
-    let mut zip_contents = std::io::Cursor::new(zip);
-    let mut zip_reader = ::zip::ZipArchive::new(&mut zip_contents).wrap_err("reading zip")?;
-    let files = zip_reader
-        .file_names()
-        .filter(|e| !e.to_lowercase().trim().ends_with(".nfo"))
-        .map(|v| v.to_string())
-        .sorted_unstable_by_key(|v| v.to_lowercase().ends_with(".srt"))
-        .rev()
-        .collect::<Vec<_>>();
-    info!(?files, "found files");
+    match command {
+        Some(c) => match c {
+            HelperCommand::EmbedSubs { subs } => {
+                soft_embed_subs(&movie_file, &subs, &language).await
+            }
+        },
+        None => {
+            info!(?movie_file, %language, "downloading");
+            let hash = hash_for_file(&movie_file)?;
+            info!("hash: {hash}");
+            let url = url(&language, hash)?;
+            let page = crawler::get_page(url).await?;
+            let link = crawler::top_rated_subs(page, top_n).and_then(|values| {
+                prompt_unless_single("which url do your want to download", values)
+                    .wrap_err("selecting url to download")
+            })?;
+            let download_url = link.download_url;
+            let zip = crawler::get_zip(download_url).await?;
+            let mut zip_contents = std::io::Cursor::new(zip);
+            let mut zip_reader =
+                ::zip::ZipArchive::new(&mut zip_contents).wrap_err("reading zip")?;
+            let files = zip_reader
+                .file_names()
+                .filter(|e| !e.to_lowercase().trim().ends_with(".nfo"))
+                .map(|v| v.to_string())
+                .sorted_unstable_by_key(|v| v.to_lowercase().ends_with(".srt"))
+                .rev()
+                .collect::<Vec<_>>();
+            info!(?files, "found files");
 
-    let file = prompt_unless_single("Select the subtitle file", files)
-        .wrap_err("choosing subtitle file")?;
+            let file = prompt_unless_single("Select the subtitle file", files)
+                .wrap_err("choosing subtitle file")?;
 
-    let extension = file
-        .split('.')
-        .next_back()
-        .ok_or_else(|| eyre!("this file has no extension"))?;
+            let extension = file
+                .split('.')
+                .next_back()
+                .ok_or_else(|| eyre!("this file has no extension"))?;
 
-    let file = zip_reader
-        .by_name(&file)
-        .wrap_err_with(|| format!("extracting {file} from the archive"))?
-        .pipe(BufReader::new)
-        .bytes()
-        .map(|v| v.wrap_err("invalid byte"))
-        .collect::<Result<Vec<_>>>()?;
-    let subtitle_file = movie_file.with_extension(extension);
-    tokio::fs::write(&subtitle_file, &file)
-        .await
-        .wrap_err_with(|| format!("writing subtitle file to {subtitle_file:?}"))?;
-    println!("{subtitle_file:?}");
-    let with_subtitles_name = movie_file
-        .extension()
-        .and_then(|e| e.to_str())
-        .ok_or_else(|| eyre!("file has no extension"))
-        .map(|extension| format!("with-subs.{extension}"))
-        .map(|extension| movie_file.with_extension(extension))
-        .wrap_err_with(|| format!("generating a with-subs file name for [{movie_file:?}]"))?;
-
-    match inquire::Select::new(
-        &format!("soft-embed subtitles into [{with_subtitles_name:?}]?"),
-        vec![true, false],
-    )
-    .prompt()
-    .unwrap_or_default()
-    {
-        true => {
-            info!(?with_subtitles_name, "saving video with subs to new path");
-            Command::new("ffmpeg")
-                .arg("-i")
-                .arg(movie_file.as_os_str())
-                .arg("-i")
-                .arg(subtitle_file.as_os_str())
-                .args([
-                    "-map",
-                    "0",
-                    "-map",
-                    "1",
-                    "-c",
-                    "copy",
-                    "-c:s",
-                    "mov_text",
-                    "-metadata:s:s:1",
-                ])
-                .arg(format!("language={language}"))
-                .arg(&with_subtitles_name)
-                .status()
+            let file = zip_reader
+                .by_name(&file)
+                .wrap_err_with(|| format!("extracting {file} from the archive"))?
+                .pipe(BufReader::new)
+                .bytes()
+                .map(|v| v.wrap_err("invalid byte"))
+                .collect::<Result<Vec<_>>>()?;
+            let subtitle_file = movie_file.with_extension(extension);
+            tokio::fs::write(&subtitle_file, &file)
                 .await
-                .wrap_err("embedding the subtitles")
-                .and_then(|status| {
-                    status
-                        .success()
-                        .then_some(())
-                        .ok_or_else(|| eyre!("bad status code: [{status:?}]"))
-                })
-                .tap_ok(move |_| {
-                    info!("file with subtitles available at {with_subtitles_name:?}");
-                })
+                .wrap_err_with(|| format!("writing subtitle file to {subtitle_file:?}"))?;
+            println!("{subtitle_file:?}");
+
+            match inquire::Select::new(
+                &format!(
+                    "soft-embed subtitles into [{:?}]?",
+                    with_subtitles_filename(&movie_file)?
+                ),
+                vec![true, false],
+            )
+            .prompt()
+            .unwrap_or_default()
+            {
+                true => soft_embed_subs(&movie_file, &subtitle_file, &language).await,
+                false => Ok(()),
+            }
         }
-        false => Ok(()),
     }
 }
